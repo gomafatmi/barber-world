@@ -1,0 +1,487 @@
+#!/usr/bin/env node
+
+/**
+ * Gestionnaire de Rendez-vous - CLI
+ * Usage: node appointments.js [commande] [options]
+ */
+
+const fs = require("fs");
+const path = require("path");
+const readline = require("readline");
+
+// ─── Configuration ───────────────────────────────────────────────────────────
+
+const DATA_FILE = path.join(
+  process.env.HOME || process.env.USERPROFILE || ".",
+  ".appointments.json"
+);
+
+// ─── Couleurs ANSI ────────────────────────────────────────────────────────────
+
+const C = {
+  reset: "\x1b[0m",
+  bold: "\x1b[1m",
+  dim: "\x1b[2m",
+  red: "\x1b[31m",
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  blue: "\x1b[34m",
+  magenta: "\x1b[35m",
+  cyan: "\x1b[36m",
+  white: "\x1b[37m",
+  bgBlue: "\x1b[44m",
+  bgGreen: "\x1b[42m",
+  bgRed: "\x1b[41m",
+};
+
+const color = (c, text) => `${c}${text}${C.reset}`;
+
+// ─── Stockage ─────────────────────────────────────────────────────────────────
+
+function loadData() {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      return JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
+    }
+  } catch {}
+  return { appointments: [], nextId: 1 };
+}
+
+function saveData(data) {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf-8");
+}
+
+// ─── Utilitaires ──────────────────────────────────────────────────────────────
+
+function parseDate(dateStr) {
+  // Accepte: DD/MM/YYYY, YYYY-MM-DD, DD-MM-YYYY
+  const patterns = [
+    { re: /^(\d{2})\/(\d{2})\/(\d{4})$/, fn: (m) => `${m[3]}-${m[2]}-${m[1]}` },
+    { re: /^(\d{4})-(\d{2})-(\d{2})$/, fn: (m) => `${m[1]}-${m[2]}-${m[3]}` },
+    { re: /^(\d{2})-(\d{2})-(\d{4})$/, fn: (m) => `${m[3]}-${m[2]}-${m[1]}` },
+  ];
+  for (const { re, fn } of patterns) {
+    const m = dateStr.match(re);
+    if (m) {
+      const iso = fn(m);
+      const d = new Date(iso);
+      if (!isNaN(d)) return iso;
+    }
+  }
+  return null;
+}
+
+function parseTime(timeStr) {
+  // Accepte: HH:MM, HHhMM, HH
+  const m = timeStr.match(/^(\d{1,2})[:h]?(\d{2})?$/);
+  if (m) {
+    const h = m[1].padStart(2, "0");
+    const min = (m[2] || "00").padStart(2, "0");
+    if (parseInt(h) < 24 && parseInt(min) < 60) return `${h}:${min}`;
+  }
+  return null;
+}
+
+function formatDate(isoDate) {
+  const [y, m, d] = isoDate.split("-");
+  return `${d}/${m}/${y}`;
+}
+
+function formatDateTime(isoDate, time) {
+  return `${formatDate(isoDate)} ${time}`;
+}
+
+function isToday(isoDate) {
+  return isoDate === new Date().toISOString().split("T")[0];
+}
+
+function isPast(isoDate, time) {
+  const dt = new Date(`${isoDate}T${time}`);
+  return dt < new Date();
+}
+
+function isSoon(isoDate, time) {
+  const dt = new Date(`${isoDate}T${time}`);
+  const diff = dt - new Date();
+  return diff > 0 && diff < 24 * 60 * 60 * 1000; // dans les 24h
+}
+
+function statusBadge(apt) {
+  if (apt.cancelled) return color(C.red, "✗ Annulé ");
+  if (isPast(apt.date, apt.time)) return color(C.dim, "✓ Passé  ");
+  if (isToday(apt.date)) return color(C.yellow + C.bold, "★ Auj.  ");
+  if (isSoon(apt.date, apt.time)) return color(C.cyan, "⚡ Bientôt");
+  return color(C.green, "● Prévu  ");
+}
+
+function printLine(char = "─", len = 60) {
+  console.log(color(C.dim, char.repeat(len)));
+}
+
+function printHeader(title) {
+  console.log();
+  printLine("═");
+  console.log(color(C.bold + C.cyan, `  📅 ${title}`));
+  printLine("═");
+  console.log();
+}
+
+// ─── Commandes ────────────────────────────────────────────────────────────────
+
+function cmdAdd(args) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const ask = (q) => new Promise((res) => rl.question(color(C.cyan, q), res));
+
+  printHeader("Nouveau Rendez-vous");
+
+  (async () => {
+    const data = loadData();
+
+    // Titre
+    let title = args[0] || (await ask("  Titre           : "));
+    title = title.trim();
+    if (!title) return console.log(color(C.red, "  ✗ Le titre est requis.")), rl.close();
+
+    // Date
+    let dateRaw = args[1] || (await ask("  Date (JJ/MM/AAAA): "));
+    const date = parseDate(dateRaw.trim());
+    if (!date) return console.log(color(C.red, "  ✗ Date invalide.")), rl.close();
+
+    // Heure
+    let timeRaw = args[2] || (await ask("  Heure (HH:MM)   : "));
+    const time = parseTime(timeRaw.trim());
+    if (!time) return console.log(color(C.red, "  ✗ Heure invalide.")), rl.close();
+
+    // Description (optionnelle)
+    let description = args[3] !== undefined ? args[3] : await ask("  Description     : ");
+    description = description.trim();
+
+    // Lieu (optionnel)
+    let location = args[4] !== undefined ? args[4] : await ask("  Lieu            : ");
+    location = location.trim();
+
+    rl.close();
+
+    const apt = {
+      id: data.nextId++,
+      title,
+      date,
+      time,
+      description: description || null,
+      location: location || null,
+      cancelled: false,
+      createdAt: new Date().toISOString(),
+    };
+
+    data.appointments.push(apt);
+    saveData(data);
+
+    console.log();
+    printLine();
+    console.log(color(C.green + C.bold, `  ✓ Rendez-vous #${apt.id} ajouté avec succès !`));
+    console.log(
+      `     ${color(C.bold, apt.title)}  —  ${color(C.yellow, formatDateTime(apt.date, apt.time))}`
+    );
+    printLine();
+    console.log();
+  })().catch(console.error);
+}
+
+function cmdList(args) {
+  const data = loadData();
+  let apts = [...data.appointments];
+
+  // Filtres
+  const showAll = args.includes("--all") || args.includes("-a");
+  const showPast = args.includes("--past") || args.includes("-p");
+  const filterDate = args.find((a) => parseDate(a));
+
+  if (!showAll && !showPast) {
+    apts = apts.filter((a) => !a.cancelled && !isPast(a.date, a.time));
+  }
+  if (showPast) {
+    apts = apts.filter((a) => isPast(a.date, a.time) || a.cancelled);
+  }
+  if (filterDate) {
+    apts = apts.filter((a) => a.date === parseDate(filterDate));
+  }
+
+  // Tri par date/heure
+  apts.sort((a, b) => `${a.date}${a.time}`.localeCompare(`${b.date}${b.time}`));
+
+  printHeader(
+    `Liste des Rendez-vous${showAll ? " (tous)" : showPast ? " (passés)" : " (à venir)"}`
+  );
+
+  if (apts.length === 0) {
+    console.log(color(C.dim, "  Aucun rendez-vous trouvé.\n"));
+    return;
+  }
+
+  let lastDate = null;
+  for (const apt of apts) {
+    if (apt.date !== lastDate) {
+      const dateLabel = isToday(apt.date) ? " 📌 AUJOURD'HUI" : "";
+      console.log(
+        `  ${color(C.bold + C.blue, formatDate(apt.date))}${color(C.yellow + C.bold, dateLabel)}`
+      );
+      lastDate = apt.date;
+    }
+
+    const status = statusBadge(apt);
+    const idStr = color(C.dim, `#${String(apt.id).padStart(3, "0")}`);
+    const timeStr = color(C.bold, apt.time);
+    const titleStr = apt.cancelled
+      ? color(C.dim, apt.title)
+      : color(C.white + C.bold, apt.title);
+
+    console.log(`    ${idStr} ${status} ${timeStr}  ${titleStr}`);
+
+    if (apt.description) console.log(`         ${color(C.dim, "ℹ " + apt.description)}`);
+    if (apt.location) console.log(`         ${color(C.dim, "📍 " + apt.location)}`);
+  }
+
+  console.log();
+  printLine();
+  console.log(
+    color(C.dim, `  ${apts.length} rendez-vous affiché(s)  •  Fichier: ${DATA_FILE}`)
+  );
+  console.log();
+}
+
+function cmdShow(args) {
+  const id = parseInt(args[0]);
+  if (!id) return console.log(color(C.red, "\n  ✗ ID requis. Usage: node appointments.js show <id>\n"));
+
+  const data = loadData();
+  const apt = data.appointments.find((a) => a.id === id);
+
+  if (!apt) return console.log(color(C.red, `\n  ✗ Rendez-vous #${id} introuvable.\n`));
+
+  printHeader(`Rendez-vous #${apt.id}`);
+
+  const fields = [
+    ["Titre", apt.title],
+    ["Date", formatDate(apt.date)],
+    ["Heure", apt.time],
+    ["Statut", apt.cancelled ? "Annulé" : isPast(apt.date, apt.time) ? "Passé" : "À venir"],
+    apt.description && ["Description", apt.description],
+    apt.location && ["Lieu", apt.location],
+    ["Créé le", new Date(apt.createdAt).toLocaleString("fr-FR")],
+  ].filter(Boolean);
+
+  for (const [label, value] of fields) {
+    console.log(`  ${color(C.cyan, label.padEnd(14))} ${value}`);
+  }
+  console.log();
+}
+
+function cmdEdit(args) {
+  const id = parseInt(args[0]);
+  if (!id) return console.log(color(C.red, "\n  ✗ Usage: node appointments.js edit <id>\n"));
+
+  const data = loadData();
+  const idx = data.appointments.findIndex((a) => a.id === id);
+  if (idx === -1) return console.log(color(C.red, `\n  ✗ Rendez-vous #${id} introuvable.\n`));
+
+  const apt = data.appointments[idx];
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const ask = (q, def) =>
+    new Promise((res) => rl.question(color(C.cyan, q) + color(C.dim, ` [${def}] `) + ": ", (ans) => res(ans.trim() || def)));
+
+  printHeader(`Modifier Rendez-vous #${id}`);
+  console.log(color(C.dim, "  (Appuyez sur Entrée pour conserver la valeur actuelle)\n"));
+
+  (async () => {
+    const title = await ask("  Titre", apt.title);
+    const dateRaw = await ask("  Date (JJ/MM/AAAA)", formatDate(apt.date));
+    const date = parseDate(dateRaw) || apt.date;
+    const timeRaw = await ask("  Heure (HH:MM)", apt.time);
+    const time = parseTime(timeRaw) || apt.time;
+    const description = await ask("  Description", apt.description || "");
+    const location = await ask("  Lieu", apt.location || "");
+    rl.close();
+
+    data.appointments[idx] = {
+      ...apt,
+      title,
+      date,
+      time,
+      description: description || null,
+      location: location || null,
+    };
+
+    saveData(data);
+    console.log();
+    console.log(color(C.green + C.bold, `  ✓ Rendez-vous #${id} mis à jour.\n`));
+  })().catch(console.error);
+}
+
+function cmdCancel(args) {
+  const id = parseInt(args[0]);
+  if (!id) return console.log(color(C.red, "\n  ✗ Usage: node appointments.js cancel <id>\n"));
+
+  const data = loadData();
+  const apt = data.appointments.find((a) => a.id === id);
+  if (!apt) return console.log(color(C.red, `\n  ✗ Rendez-vous #${id} introuvable.\n`));
+  if (apt.cancelled) return console.log(color(C.yellow, `\n  ⚠ Rendez-vous #${id} déjà annulé.\n`));
+
+  apt.cancelled = true;
+  saveData(data);
+  console.log(color(C.green, `\n  ✓ Rendez-vous #${id} "${apt.title}" annulé.\n`));
+}
+
+function cmdDelete(args) {
+  const id = parseInt(args[0]);
+  if (!id) return console.log(color(C.red, "\n  ✗ Usage: node appointments.js delete <id>\n"));
+
+  const data = loadData();
+  const idx = data.appointments.findIndex((a) => a.id === id);
+  if (idx === -1) return console.log(color(C.red, `\n  ✗ Rendez-vous #${id} introuvable.\n`));
+
+  const apt = data.appointments[idx];
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+  rl.question(
+    color(C.yellow, `\n  ⚠ Supprimer "${apt.title}" (${formatDateTime(apt.date, apt.time)}) ? `) +
+      color(C.bold, "[o/N] "),
+    (ans) => {
+      rl.close();
+      if (ans.toLowerCase() === "o") {
+        data.appointments.splice(idx, 1);
+        saveData(data);
+        console.log(color(C.green, `  ✓ Rendez-vous #${id} supprimé.\n`));
+      } else {
+        console.log(color(C.dim, "  Annulé.\n"));
+      }
+    }
+  );
+}
+
+function cmdToday() {
+  const data = loadData();
+  const today = new Date().toISOString().split("T")[0];
+  const apts = data.appointments
+    .filter((a) => a.date === today && !a.cancelled)
+    .sort((a, b) => a.time.localeCompare(b.time));
+
+  printHeader("Rendez-vous d'Aujourd'hui");
+
+  if (apts.length === 0) {
+    console.log(color(C.dim, "  Aucun rendez-vous aujourd'hui. 🎉\n"));
+    return;
+  }
+
+  for (const apt of apts) {
+    const passed = isPast(apt.date, apt.time);
+    const timeStr = color(passed ? C.dim : C.bold + C.yellow, apt.time);
+    const titleStr = color(passed ? C.dim : C.bold, apt.title);
+    const check = passed ? color(C.dim, "✓") : color(C.green, "●");
+    console.log(`  ${check} ${timeStr}  ${titleStr}`);
+    if (apt.location) console.log(`       ${color(C.dim, "📍 " + apt.location)}`);
+  }
+  console.log();
+}
+
+function cmdSearch(args) {
+  const query = args.join(" ").toLowerCase();
+  if (!query) return console.log(color(C.red, "\n  ✗ Usage: node appointments.js search <terme>\n"));
+
+  const data = loadData();
+  const results = data.appointments.filter(
+    (a) =>
+      a.title.toLowerCase().includes(query) ||
+      (a.description && a.description.toLowerCase().includes(query)) ||
+      (a.location && a.location.toLowerCase().includes(query))
+  );
+
+  printHeader(`Recherche : "${args.join(" ")}"`);
+
+  if (results.length === 0) {
+    console.log(color(C.dim, "  Aucun résultat.\n"));
+    return;
+  }
+
+  for (const apt of results) {
+    const idStr = color(C.dim, `#${String(apt.id).padStart(3, "0")}`);
+    console.log(
+      `  ${idStr} ${statusBadge(apt)} ${color(C.bold, apt.time)}  ${color(C.white + C.bold, apt.title)}  ${color(C.dim, formatDate(apt.date))}`
+    );
+  }
+  console.log(`\n  ${results.length} résultat(s) trouvé(s)\n`);
+}
+
+function cmdHelp() {
+  printHeader("Gestionnaire de Rendez-vous");
+
+  const cmds = [
+    ["add [titre] [date] [heure]", "Ajouter un rendez-vous (interactif si args manquants)"],
+    ["list", "Lister les rendez-vous à venir"],
+    ["list --all, -a", "Lister tous les rendez-vous"],
+    ["list --past, -p", "Lister les rendez-vous passés"],
+    ["list <date>", "Filtrer par date (ex: 25/12/2025)"],
+    ["today", "Voir les rendez-vous d'aujourd'hui"],
+    ["show <id>", "Afficher les détails d'un rendez-vous"],
+    ["edit <id>", "Modifier un rendez-vous"],
+    ["cancel <id>", "Annuler un rendez-vous"],
+    ["delete <id>", "Supprimer un rendez-vous"],
+    ["search <terme>", "Rechercher dans les rendez-vous"],
+    ["help", "Afficher cette aide"],
+  ];
+
+  for (const [cmd, desc] of cmds) {
+    console.log(
+      `  ${color(C.cyan + C.bold, ("node appointments.js " + cmd).padEnd(44))} ${color(C.dim, desc)}`
+    );
+  }
+
+  console.log();
+  console.log(color(C.dim, `  Données stockées dans : ${DATA_FILE}`));
+  console.log();
+}
+
+// ─── Point d'entrée ───────────────────────────────────────────────────────────
+
+const [, , command = "help", ...args] = process.argv;
+
+switch (command.toLowerCase()) {
+  case "add":
+  case "ajouter":
+    cmdAdd(args);
+    break;
+  case "list":
+  case "ls":
+  case "liste":
+    cmdList(args);
+    break;
+  case "today":
+  case "auj":
+  case "aujourd'hui":
+    cmdToday();
+    break;
+  case "show":
+  case "voir":
+    cmdShow(args);
+    break;
+  case "edit":
+  case "modifier":
+    cmdEdit(args);
+    break;
+  case "cancel":
+  case "annuler":
+    cmdCancel(args);
+    break;
+  case "delete":
+  case "supprimer":
+    cmdDelete(args);
+    break;
+  case "search":
+  case "chercher":
+    cmdSearch(args);
+    break;
+  case "help":
+  case "aide":
+  default:
+    cmdHelp();
+    break;
+}
